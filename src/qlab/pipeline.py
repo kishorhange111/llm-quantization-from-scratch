@@ -11,7 +11,8 @@ Finished configurations are kept in ``<out>/runs.jsonl``.
 
 W8A8 configurations also quantise activations. Each input is quantised per tensor to 8 bits,
 dynamically (absmax), before the matmul. SmoothQuant (Xiao et al. 2023) first divides
-input channel j by ``s_j = max|x_j|^α / max|w_j|^(1−α)`` and multiplies the weights by it.
+input channel j of the LayerNorm-fed layers (``c_attn``, ``c_fc``) by
+``s_j = max|x_j|^α / max|w_j|^(1−α)`` and multiplies the weights by it.
 The product is unchanged, but activation outliers move into the weights, which tolerate
 them better.
 """
@@ -34,6 +35,13 @@ from torch import nn
 from .quant import awq, gptq, output_error, rtn
 
 LAYERS = ("attn.c_attn", "attn.c_proj", "mlp.c_fc", "mlp.c_proj")
+# Layers whose input comes straight from a LayerNorm, so 1/s folds into its gain and bias
+# for free. SmoothQuant smooths only these. The two output projections read attention /
+# GELU outputs, where the division would be an extra runtime op, and on GPT-2 it also
+# backfires (see README): an fc2 input channel that is nearly silent in calibration gets a
+# tiny s, and when it fires at evaluation time 1/s blows it up to dominate the per-tensor
+# scale.
+SMOOTHABLE = ("attn.c_attn", "mlp.c_fc")
 
 
 class ActQuantLinear(nn.Module):
@@ -84,6 +92,7 @@ def quantize_model(
     group: int | None = 128,
     act_order: bool = False,
     alpha: float = 0.5,
+    smooth_all: bool = False,
     n_sample: int = 4096,
     seed: int = 0,
 ) -> dict:
@@ -126,7 +135,7 @@ def quantize_model(
                 Wq, a = awq(W, X, bits, group)
                 diag["awq_alpha"].append(a)
             elif method in ("w8a8", "smoothquant"):
-                if method == "smoothquant":
+                if method == "smoothquant" and (smooth_all or name in SMOOTHABLE):
                     wmax = W.abs().amax(0).clamp(min=1e-5)
                     s = (st["amax"].clamp(min=1e-5) ** alpha / wmax ** (1 - alpha)).clamp(min=1e-5)
                 else:
@@ -201,6 +210,10 @@ CONFIGS = [
     ("gptq w3 per-channel", dict(method="gptq", bits=3, group=None)),
     ("w8a8 per-tensor", dict(method="w8a8")),
     ("smoothquant w8a8 α=0.5", dict(method="smoothquant", alpha=0.5)),
+    (
+        "smoothquant w8a8 α=0.5, all 4 layers",
+        dict(method="smoothquant", alpha=0.5, smooth_all=True),
+    ),
 ]
 
 

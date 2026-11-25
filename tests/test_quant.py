@@ -159,3 +159,22 @@ def test_pipeline_end_to_end_and_resume(tmp_path):
     main(args, model=m, tokens=toks)
     assert len((tmp_path / "runs.jsonl").read_text(encoding="utf-8").splitlines()) == 4
     assert "Δ vs fp16" in (tmp_path / "summary.md").read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("smooth_all", [False, True])
+def test_smoothquant_smooths_only_layernorm_fed_layers_by_default(smooth_all):
+    from qlab.pipeline import ActQuantLinear
+
+    q = copy.deepcopy(_tiny())
+    ids = torch.randint(0, 200, (4, 64), generator=torch.Generator().manual_seed(5))
+    quantize_model(q, "smoothquant", ids, n_sample=64, smooth_all=smooth_all)
+    blk = q.transformer.h[0]
+    for name, mod in (
+        ("c_attn", blk.attn.c_attn),
+        ("c_fc", blk.mlp.c_fc),
+        ("attn.c_proj", blk.attn.c_proj),
+        ("mlp.c_proj", blk.mlp.c_proj),
+    ):
+        assert isinstance(mod, ActQuantLinear)
+        unsmoothed = bool(torch.all(mod.inv_s == 1))
+        assert unsmoothed == (not smooth_all and "proj" in name), name
